@@ -82,7 +82,6 @@ enum TokenId {
     TokenIdKeywordOr,
     TokenIdKeywordOrElse,
     TokenIdKeywordPacked,
-    TokenIdKeywordPromise,
     TokenIdKeywordPub,
     TokenIdKeywordResume,
     TokenIdKeywordReturn,
