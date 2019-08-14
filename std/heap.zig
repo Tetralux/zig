@@ -424,6 +424,105 @@ pub const ArenaAllocator = struct {
     }
 };
 
+/// A ring buffer which keeps the data around until it is overwritten by a
+/// newer allocation after the buffer becomes full.
+/// Useful for when you want to allocate something, use it close to where you allocated it, and then don't care about it anymore.
+pub const RingAllocator = struct {
+    pub allocator: Allocator,
+    child_allocator: ?*Allocator,
+    buffer: []u8,
+    end_index: usize,
+
+    pub fn initAlloc(allocator: *Allocator, capacity_in_bytes: usize) !RingAllocator {
+        return RingAllocator {
+            .allocator = Allocator{
+                .reallocFn = realloc,
+                .shrinkFn = shrink,
+            },
+            .child_allocator = allocator,
+            .buffer = try allocator.alignedAlloc(u8, @alignOf(usize), capacity_in_bytes),
+            .end_index = 0,
+        };
+    }
+
+    pub fn init(buffer: []u8) RingAllocator {
+        return RingAllocator {
+            .allocator = Allocator{
+                .reallocFn = realloc,
+                .shrinkFn = shrink,
+            },
+            .child_allocator = null,
+            .buffer = buffer,
+            .end_index = 0,
+        };
+    }
+
+    pub fn deinit(self: *RingAllocator) void {
+        if (self.child_allocator) |ca| ca.free(self.buffer);
+    }
+
+    pub fn reset(self: *RingAllocator) void {
+        self.end_index = 0;
+    }
+
+    fn realloc(allocator: *Allocator, old_mem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
+        const self = @fieldParentPtr(RingAllocator, "allocator", allocator);
+        assert(old_mem.len <= self.end_index);
+
+        // If we're realloc'ing the last thing that was allocated,
+        // then we can just grow it, if there's enough space.
+        // NOTE: We also move it if the alignment changed.
+        if (old_mem.ptr == self.buffer.ptr + self.end_index - old_mem.len) {
+            const aligned_addr = mem.alignForward(@ptrToInt(old_mem.ptr), new_align);
+            const old_cursor_addr = @ptrToInt(old_mem.ptr);
+            const aligned_index = self.end_index - old_mem.len + (aligned_addr - old_cursor_addr);
+            if (self.buffer.len - aligned_index >= new_size) {
+                const new_end_index = aligned_index + new_size;
+                const result = self.buffer[aligned_index..new_end_index];
+                @memcpy(result.ptr, old_mem.ptr, std.math.min(old_mem.len, result.len));
+                self.end_index = new_end_index;
+                return result;
+            }
+        }
+        const result = try alloc(allocator, new_size, new_align);
+        @memcpy(result.ptr, old_mem.ptr, std.math.min(old_mem.len, result.len));
+        return result;
+    }
+
+    fn shrink(allocator: *Allocator, old_mem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
+        return old_mem[0..new_size];
+    }
+
+    fn alloc(allocator: *Allocator, n: usize, alignment: u29) ![]u8 {
+        const self = @fieldParentPtr(RingAllocator, "allocator", allocator);
+
+        // if the object is bigger than the buffer, don't even bother trying.
+        if (n > self.buffer.len) return error.OutOfMemory;
+
+        var cursor_addr = @ptrToInt(self.buffer.ptr) + self.end_index;
+        var aligned_start_addr = mem.alignForward(cursor_addr, alignment);
+        var aligned_index = self.end_index + (aligned_start_addr - cursor_addr);
+
+        // If it would fit with align(1), but would not with requested alignment,
+        // try resetting to the beginning of the buffer and see if it fits then.
+        if (self.buffer.len - aligned_index < n) {        
+            const buf_start_addr = @ptrToInt(self.buffer.ptr);
+            aligned_index = mem.alignForward(buf_start_addr, alignment) - buf_start_addr;
+        }
+        const new_end_index = aligned_index + n;
+        
+        if (new_end_index > self.buffer.len) {
+            // the object does fit in the buffer, but taking alignment into
+            // account, we actually cannot fit it in.
+            return error.OutOfMemory;
+        }
+
+        const result = self.buffer[aligned_index..new_end_index];
+        self.end_index = new_end_index;
+        return result;
+    }
+};
+
 pub const FixedBufferAllocator = struct {
     allocator: Allocator,
     end_index: usize,
@@ -773,6 +872,43 @@ test "FixedBufferAllocator" {
     try testAllocatorAligned(&fixed_buffer_allocator.allocator, 16);
     try testAllocatorLargeAlignment(&fixed_buffer_allocator.allocator);
     try testAllocatorAlignedShrink(&fixed_buffer_allocator.allocator);
+}
+
+test "RingAllocator" {
+    {
+        // var ring = try RingAllocator.initAlloc(direct_allocator, @sizeOf(u64));
+        var buf: [@sizeOf(u64)] u8 align(@alignOf(usize)) = undefined;
+        var ring = RingAllocator.init(buf[0..]);
+        defer ring.deinit();
+
+        var allocator = &ring.allocator;
+
+        testing.expectError(error.OutOfMemory, allocator.create(u128)); // bigger than buffer
+
+        var a1 = allocator.create(u32) catch unreachable;
+        var a2 = allocator.create(u16) catch unreachable;
+        var a3 = allocator.create(u64) catch unreachable;
+        var a4 = allocator.create(u16) catch unreachable;
+
+        // The origin should be aligned to @alignOf(usize).
+        const origin = @ptrToInt(ring.buffer.ptr);
+        testing.expect(@ptrToInt(a1) == origin);
+        testing.expect(@ptrToInt(a2) == origin + @sizeOf(u32));
+        testing.expect(@ptrToInt(a3) == origin);
+        testing.expect(@ptrToInt(a4) == origin);
+
+    }
+    {
+        var ring = try RingAllocator.initAlloc(direct_allocator, 80000 * @sizeOf(u64));
+        defer ring.deinit();
+
+        var allocator = &ring.allocator;
+
+        try testAllocator(allocator);
+        try testAllocatorAligned(allocator, 16);
+        try testAllocatorLargeAlignment(allocator);
+        try testAllocatorAlignedShrink(allocator);
+    }
 }
 
 test "FixedBufferAllocator Reuse memory on realloc" {
