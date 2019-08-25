@@ -424,45 +424,39 @@ pub const ArenaAllocator = struct {
     }
 };
 
-/// A ring buffer which keeps the data around until it is overwritten by a
-/// newer allocation after the buffer becomes full.
-/// Useful for when you want to allocate something, use it close to where you allocated it, and then don't care about it anymore.
+/// A ring buffer as an allocator.
+/// Cheap to free and allocate, and reuses the same buffer for all eternity, so long you
+/// don't need more than it can hold at any given moment.
+///
+/// Falls back to a backup allocator if you do need more, and then keeps that extra space around
+/// if you need it again.
+///
+/// Useful for when you want to allocate something, use it close to where you allocated it,
+/// and then don't care about it anymore, lots of times.
+/// Like mprintfs in a processing loop, for instance.
 pub const RingAllocator = struct {
     pub allocator: Allocator,
-    child_allocator: ?*Allocator,
+    fallback_allocator: ?*Allocator = null,
     buffer: []u8,
-    end_index: usize,
+    end_index: usize = 0,
+    used: usize = 0,
 
-    pub fn initAlloc(allocator: *Allocator, capacity_in_bytes: usize) !RingAllocator {
+    pub fn init(buffer: []u8, fallback_allocator: ?*Allocator) RingAllocator {
         return RingAllocator {
             .allocator = Allocator{
                 .reallocFn = realloc,
                 .shrinkFn = shrink,
             },
-            .child_allocator = allocator,
-            .buffer = try allocator.alignedAlloc(u8, @alignOf(usize), capacity_in_bytes),
-            .end_index = 0,
-        };
-    }
-
-    pub fn init(buffer: []u8) RingAllocator {
-        return RingAllocator {
-            .allocator = Allocator{
-                .reallocFn = realloc,
-                .shrinkFn = shrink,
-            },
-            .child_allocator = null,
             .buffer = buffer,
-            .end_index = 0,
+            .fallback_allocator = fallback_allocator,
         };
     }
 
-    pub fn deinit(self: *RingAllocator) void {
-        if (self.child_allocator) |ca| ca.free(self.buffer);
-    }
+    pub fn deinit(self: *RingAllocator) void {} // TODO: Free fallback allocations?
 
     pub fn reset(self: *RingAllocator) void {
         self.end_index = 0;
+        self.used = 0;
     }
 
     fn realloc(allocator: *Allocator, old_mem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
@@ -481,6 +475,8 @@ pub const RingAllocator = struct {
                 const result = self.buffer[aligned_index..new_end_index];
                 @memcpy(result.ptr, old_mem.ptr, std.math.min(old_mem.len, result.len));
                 self.end_index = new_end_index;
+                self.used -= old_mem.len;
+                self.used += old_cursor_addr - @ptrToInt(result.ptr + result.len);
                 return result;
             }
         }
@@ -490,6 +486,10 @@ pub const RingAllocator = struct {
     }
 
     fn shrink(allocator: *Allocator, old_mem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
+        const self = @fieldParentPtr(RingAllocator, "allocator", allocator);
+        self.used -= old_mem.len;
+        self.used += new_size;
+        assert(old_align == new_align);
         return old_mem[0..new_size];
     }
 
@@ -511,14 +511,13 @@ pub const RingAllocator = struct {
         }
         const new_end_index = aligned_index + n;
         
-        if (new_end_index > self.buffer.len) {
-            // the object does fit in the buffer, but taking alignment into
-            // account, we actually cannot fit it in.
-            return error.OutOfMemory;
-        }
+        // the object does fit in the buffer, but taking alignment into
+        // account, we actually cannot fit it in.
+        if (new_end_index > self.buffer.len) return error.OutOfMemory;
 
         const result = self.buffer[aligned_index..new_end_index];
         self.end_index = new_end_index;
+        self.used += result.len;
         return result;
     }
 };
@@ -864,42 +863,40 @@ test "ArenaAllocator" {
     try testAllocatorAlignedShrink(&arena_allocator.allocator);
 }
 
-var test_fixed_buffer_allocator_memory: [80000 * @sizeOf(u64)]u8 = undefined;
-test "FixedBufferAllocator" {
-    var fixed_buffer_allocator = FixedBufferAllocator.init(test_fixed_buffer_allocator_memory[0..]);
-
-    try testAllocator(&fixed_buffer_allocator.allocator);
-    try testAllocatorAligned(&fixed_buffer_allocator.allocator, 16);
-    try testAllocatorLargeAlignment(&fixed_buffer_allocator.allocator);
-    try testAllocatorAlignedShrink(&fixed_buffer_allocator.allocator);
-}
-
 test "RingAllocator" {
+    var arena_allocator = ArenaAllocator.init(direct_allocator);
+    defer arena_allocator.deinit();
+
     {
-        // var ring = try RingAllocator.initAlloc(direct_allocator, @sizeOf(u64));
-        var buf: [@sizeOf(u64)] u8 align(@alignOf(usize)) = undefined;
-        var ring = RingAllocator.init(buf[0..]);
+        var ring = try RingAllocator.initAlloc(&arena_allocator.allocator, @sizeOf(u64));
         defer ring.deinit();
 
         var allocator = &ring.allocator;
 
         testing.expectError(error.OutOfMemory, allocator.create(u128)); // bigger than buffer
 
-        var a1 = allocator.create(u32) catch unreachable;
-        var a2 = allocator.create(u16) catch unreachable;
-        var a3 = allocator.create(u64) catch unreachable;
-        var a4 = allocator.create(u16) catch unreachable;
-
         // The origin should be aligned to @alignOf(usize).
         const origin = @ptrToInt(ring.buffer.ptr);
-        testing.expect(@ptrToInt(a1) == origin);
-        testing.expect(@ptrToInt(a2) == origin + @sizeOf(u32));
-        testing.expect(@ptrToInt(a3) == origin);
-        testing.expect(@ptrToInt(a4) == origin);
+
+        var a1 = allocator.create(u32) catch unreachable;
+        testing.expectEqual(@ptrToInt(a1), origin);
+        allocator.destroy(a1);
+
+        var a2 = allocator.create(u16) catch unreachable;
+        testing.expectEqual(@ptrToInt(a2), origin + @sizeOf(u32)); // does start the front of buffer until wrap around.
+        allocator.destroy(a2);
+
+        var a3 = allocator.create(u32) catch unreachable; // wrap-around because it doesn't fit.
+        testing.expectEqual(@ptrToInt(a3), origin);
+        allocator.destroy(a3);
+
+        var a4 = allocator.create(u16) catch unreachable;
+        testing.expectEqual(@ptrToInt(a4), origin + @sizeOf(u32));
+        allocator.destroy(a4);
 
     }
     {
-        var ring = try RingAllocator.initAlloc(direct_allocator, 80000 * @sizeOf(u64));
+        var ring = try RingAllocator.initAlloc(&arena_allocator.allocator, 80000 * @sizeOf(u64));
         defer ring.deinit();
 
         var allocator = &ring.allocator;
@@ -909,6 +906,16 @@ test "RingAllocator" {
         try testAllocatorLargeAlignment(allocator);
         try testAllocatorAlignedShrink(allocator);
     }
+}
+
+var test_fixed_buffer_allocator_memory: [80000 * @sizeOf(u64)]u8 = undefined;
+test "FixedBufferAllocator" {
+    var fixed_buffer_allocator = FixedBufferAllocator.init(test_fixed_buffer_allocator_memory[0..]);
+
+    try testAllocator(&fixed_buffer_allocator.allocator);
+    try testAllocatorAligned(&fixed_buffer_allocator.allocator, 16);
+    try testAllocatorLargeAlignment(&fixed_buffer_allocator.allocator);
+    try testAllocatorAlignedShrink(&fixed_buffer_allocator.allocator);
 }
 
 test "FixedBufferAllocator Reuse memory on realloc" {

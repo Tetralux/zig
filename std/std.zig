@@ -1,5 +1,7 @@
 pub const AlignedArrayList = @import("array_list.zig").AlignedArrayList;
 pub const ArrayList = @import("array_list.zig").ArrayList;
+pub const BucketArray = @import("bucket_array.zig").BucketArray;
+pub const BucketLocator = @import("bucket_array.zig").BucketLocator;
 pub const AutoHashMap = @import("hash_map.zig").AutoHashMap;
 pub const BufMap = @import("buf_map.zig").BufMap;
 pub const BufSet = @import("buf_set.zig").BufSet;
@@ -66,6 +68,7 @@ test "std" {
     _ = @import("buf_map.zig");
     _ = @import("buf_set.zig");
     _ = @import("buffer.zig");
+    _ = @import("bucket_array.zig");
     _ = @import("hash_map.zig");
     _ = @import("linked_list.zig");
     _ = @import("mutex.zig");
